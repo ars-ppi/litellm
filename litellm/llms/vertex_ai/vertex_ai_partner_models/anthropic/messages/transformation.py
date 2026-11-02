@@ -265,6 +265,9 @@ class VertexAIPartnerModelsAnthropicMessagesConfig(AnthropicMessagesConfig, Vert
 
         sanitize_vertex_anthropic_output_params(anthropic_messages_request, model)
 
+        # Serialize the per-turn-stable fields (system, tools, settings) before the growing
+        # conversation, so consecutive turns share the longest possible byte prefix.
+        anthropic_messages_request["messages"] = anthropic_messages_request.pop("messages")
         return anthropic_messages_request
 
     def sign_request(

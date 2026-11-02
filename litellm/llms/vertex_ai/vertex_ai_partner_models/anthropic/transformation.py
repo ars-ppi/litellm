@@ -225,6 +225,9 @@ class VertexAIAnthropicConfig(AnthropicConfig):
         if header_betas:
             headers["anthropic-beta"] = ",".join(sorted(header_betas))
 
+        # Serialize the per-turn-stable fields (system, tools, settings) before the growing
+        # conversation, so consecutive turns share the longest possible byte prefix.
+        data["messages"] = data.pop("messages")  # rebind-ok: reinsert to move the key to the end
         return data
 
     def uses_native_structured_output(self, model: str) -> bool:
