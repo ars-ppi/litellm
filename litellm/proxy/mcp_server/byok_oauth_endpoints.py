@@ -22,12 +22,12 @@ from urllib.parse import urlencode, urlparse
 
 import jwt
 from fastapi import APIRouter, Depends, Form, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 
 from litellm._logging import verbose_proxy_logger
 from litellm.proxy._types import UserAPIKeyAuth
 from litellm.proxy.mcp_server.catalog import public_catalog_operation
-from litellm.proxy.mcp_server.db import store_user_credential
+from litellm.proxy.mcp_server.db import get_user_credential, store_user_credential
 from litellm.proxy.mcp_server.oauth_utils import (
     BYOK_RESOURCE_METADATA_PATH,
     TOKEN_NO_CACHE_HEADERS,
@@ -222,6 +222,76 @@ async def _byok_session_auth(request: Request) -> UserAPIKeyAuth:
     if not await _session_key_is_live(session_key):
         raise HTTPException(status_code=401, detail="login_required")
     return UserAPIKeyAuth(api_key="byok_session_cookie", user_id=user_id)
+
+
+async def _byok_session_user_id_or_none(request: Request) -> str | None:
+    """Same check as ``_byok_session_auth``, but returns ``None`` instead of
+    raising, for the authorize GET, which works without a session."""
+    user_id, session_key = _session_identity_from_cookie(request)
+    if not user_id or not await _session_key_is_live(session_key):
+        return None
+    return user_id
+
+
+async def _stored_byok_credential(user_id: str, server_id: str) -> str | None:
+    """The API key ``user_id`` already stored for ``server_id``, or None.
+
+    Looked up strictly by the session's own user_id, so a stored key is only
+    ever reused for the user who stored it."""
+    from litellm.proxy.proxy_server import prisma_client
+
+    if prisma_client is None or not server_id:
+        return None
+    try:
+        return await get_user_credential(prisma_client, user_id, server_id)
+    except Exception as exc:
+        verbose_proxy_logger.warning("byok authorize: stored credential lookup failed: %s", exc)
+        return None
+
+
+def _issue_authorization_code(
+    *,
+    user_id: str,
+    api_key: str,
+    client_id: str,
+    redirect_uri: str,
+    code_challenge: str,
+    code_challenge_method: str,
+    state: str,
+    server_id: str,
+) -> RedirectResponse:
+    """Validate the authorization request, store a short-lived code bound to
+    ``user_id`` and redirect to ``redirect_uri`` with ``code`` and ``state``."""
+    _purge_expired_codes()
+
+    validate_loopback_redirect_uri(redirect_uri)
+
+    # Reject new codes if the store is at capacity (prevents memory exhaustion
+    # from a burst of abandoned OAuth flows).
+    if len(_byok_auth_codes) >= _AUTH_CODES_MAX_SIZE:
+        raise HTTPException(status_code=503, detail="Too many pending authorization flows")
+
+    if code_challenge_method != "S256":
+        raise HTTPException(status_code=400, detail="Only S256 code_challenge_method is supported")
+
+    auth_code: Final = str(uuid.uuid4())
+    _byok_auth_codes[auth_code] = {
+        "api_key": api_key,
+        "server_id": server_id,
+        "code_challenge": code_challenge,
+        "redirect_uri": redirect_uri,
+        # RFC 6749 §4.1.3 defense-in-depth: if the authorization request
+        # declared a client_id, the token request must submit the same
+        # value. Stored even though we don't pre-register clients.
+        "client_id": client_id,
+        "user_id": user_id,
+        "expires_at": time.time() + _AUTH_CODE_TTL_SECONDS,
+    }
+
+    params: Final = urlencode({"code": auth_code, "state": state})
+    separator: Final = "&" if "?" in redirect_uri else "?"
+    location: Final = f"{redirect_uri}{separator}{params}"
+    return RedirectResponse(url=location, status_code=302)
 
 
 def _build_authorize_html(
@@ -752,16 +822,22 @@ async def byok_authorize_get(
     code_challenge_method: str | None = None,
     state: str | None = None,
     server_id: str | None = None,
-) -> HTMLResponse:
+    session_user_id: str | None = Depends(_byok_session_user_id_or_none),
+) -> Response:
     """
     Show the BYOK API-key entry form.
 
     The MCP client navigates the user here; the user types their API key and
     clicks "Connect & Authorize", which POSTs back to this same path.
 
-    This GET is intentionally unauthenticated: it only renders HTML with no
-    state change. The POST handler enforces ``user_api_key_auth`` and pins
-    the stored credential to the authenticated session.
+    Without a UI session this GET only renders HTML with no state change. The
+    POST handler enforces the UI session and pins the stored credential to it.
+
+    With a live UI session whose user already stored a key for ``server_id``,
+    the key is not asked for again: the authorization code is issued directly,
+    bound to that user and to the request's PKCE challenge, redirect_uri,
+    client_id and state, exactly as the POST would. To replace the key, the
+    user deletes or overwrites it via ``/v1/mcp/server/{server_id}/user-credential``.
     """
     if response_type != "code":
         raise HTTPException(status_code=400, detail="response_type must be 'code'")
@@ -772,6 +848,20 @@ async def byok_authorize_get(
     validate_loopback_redirect_uri(redirect_uri)
     if not code_challenge:
         raise HTTPException(status_code=400, detail="code_challenge is required")
+
+    if session_user_id is not None and server_id:
+        stored_key: Final = await _stored_byok_credential(session_user_id, server_id)
+        if stored_key:
+            return _issue_authorization_code(
+                user_id=session_user_id,
+                api_key=stored_key,
+                client_id=client_id or "",
+                redirect_uri=redirect_uri,
+                code_challenge=code_challenge,
+                code_challenge_method=code_challenge_method or "S256",
+                state=state or "",
+                server_id=server_id,
+            )
 
     # Resolve server metadata (name, description items, help URL).
     server_name = "MCP Server"
@@ -818,27 +908,16 @@ async def byok_authorize_post(
     code_challenge_method: str = Form(default="S256"),
     state: str = Form(default=""),
     server_id: str = Form(default=""),
-    api_key: str = Form(...),
+    api_key: str = Form(default=""),
     user_api_key_dict: UserAPIKeyAuth = Depends(_byok_session_auth),
 ) -> RedirectResponse:
     """
     Process the BYOK API-key form submission.
 
     Stores a short-lived authorization code and redirects the client back to
-    redirect_uri with ?code=...&state=... query parameters.
+    redirect_uri with ?code=...&state=... query parameters. ``api_key`` may be
+    omitted when the session's user already stored a key for ``server_id``.
     """
-    _purge_expired_codes()
-
-    validate_loopback_redirect_uri(redirect_uri)
-
-    # Reject new codes if the store is at capacity (prevents memory exhaustion
-    # from a burst of abandoned OAuth flows).
-    if len(_byok_auth_codes) >= _AUTH_CODES_MAX_SIZE:
-        raise HTTPException(status_code=503, detail="Too many pending authorization flows")
-
-    if code_challenge_method != "S256":
-        raise HTTPException(status_code=400, detail="Only S256 code_challenge_method is supported")
-
     # Identity comes from the authenticated session, not the OAuth client_id
     # form field (RFC 6749 §2.2: client_id identifies the client application,
     # not the user). We do bind the code to the submitted client_id so the
@@ -847,24 +926,20 @@ async def byok_authorize_post(
     if not user_id:
         raise HTTPException(status_code=401, detail="login_required")
 
-    auth_code: Final = str(uuid.uuid4())
-    _byok_auth_codes[auth_code] = {
-        "api_key": api_key,
-        "server_id": server_id,
-        "code_challenge": code_challenge,
-        "redirect_uri": redirect_uri,
-        # RFC 6749 §4.1.3 defense-in-depth: if the authorization request
-        # declared a client_id, the token request must submit the same
-        # value. Stored even though we don't pre-register clients.
-        "client_id": client_id,
-        "user_id": user_id,
-        "expires_at": time.time() + _AUTH_CODE_TTL_SECONDS,
-    }
+    key: Final = api_key or await _stored_byok_credential(user_id, server_id)
+    if not key:
+        raise HTTPException(status_code=400, detail="api_key is required")
 
-    params: Final = urlencode({"code": auth_code, "state": state})
-    separator: Final = "&" if "?" in redirect_uri else "?"
-    location: Final = f"{redirect_uri}{separator}{params}"
-    return RedirectResponse(url=location, status_code=302)
+    return _issue_authorization_code(
+        user_id=user_id,
+        api_key=key,
+        client_id=client_id,
+        redirect_uri=redirect_uri,
+        code_challenge=code_challenge,
+        code_challenge_method=code_challenge_method,
+        state=state,
+        server_id=server_id,
+    )
 
 
 # ---------------------------------------------------------------------------

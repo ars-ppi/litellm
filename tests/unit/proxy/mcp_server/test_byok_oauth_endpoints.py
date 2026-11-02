@@ -285,6 +285,180 @@ def test_authorize_get_rejects_non_loopback_redirect_uri(client):
     assert resp.status_code == 400
 
 
+_REUSE_PARAMS: Final = {
+    "client_id": "test-client",
+    "redirect_uri": "http://127.0.0.1:3000/callback",
+    "response_type": "code",
+    "code_challenge": "abc123",
+    "code_challenge_method": "S256",
+    "state": "xyz",
+    "server_id": "my-server",
+}
+
+
+def _session_cookie(user_id: str = "browser-user-42") -> str:
+    import jwt as _jwt
+
+    return _jwt.encode(
+        {"user_id": user_id, "login_method": "sso", "exp": int(time.time()) + 3600},
+        "test-master-key",
+        algorithm="HS256",
+    )
+
+
+def _no_catalog_db():
+    """The GET runs inside a catalog operation, which needs a real DB once
+    ``prisma_client`` is patched; these tests only exercise the authorize logic."""
+    return patch(
+        "litellm.proxy.mcp_server.mcp_server_manager.global_mcp_server_manager.catalog.operation",
+        MagicMock(),
+    )
+
+
+def _code_from_location(location: str) -> str:
+    from urllib.parse import parse_qs, urlparse
+
+    return parse_qs(urlparse(location).query)["code"][0]
+
+
+def test_authorize_get_reuses_stored_key_for_session_user(unauthenticated_client):
+    """A user who already stored a key for this server is not asked again:
+    the code is issued directly, bound to the session user and the request's
+    PKCE challenge, redirect_uri, client_id and state."""
+    lookup = AsyncMock(return_value="sk-stored-key")
+    with (
+        patch("litellm.proxy.proxy_server.master_key", "test-master-key"),
+        patch("litellm.proxy.proxy_server.prisma_client", MagicMock()),
+        _no_catalog_db(),
+        patch("litellm.proxy.mcp_server.byok_oauth_endpoints.get_user_credential", lookup),
+    ):
+        resp = unauthenticated_client.get(
+            "/v1/mcp/oauth/authorize",
+            params=_REUSE_PARAMS,
+            cookies={"token": _session_cookie()},
+            follow_redirects=False,
+        )
+    assert resp.status_code == 302
+    assert resp.headers["location"].startswith("http://127.0.0.1:3000/callback?")
+    assert "state=xyz" in resp.headers["location"]
+    entry = _byok_auth_codes[_code_from_location(resp.headers["location"])]
+    assert entry["api_key"] == "sk-stored-key"
+    assert entry["user_id"] == "browser-user-42"
+    assert entry["server_id"] == "my-server"
+    assert entry["code_challenge"] == "abc123"
+    assert entry["client_id"] == "test-client"
+    assert entry["redirect_uri"] == "http://127.0.0.1:3000/callback"
+    # The lookup is keyed by the session's own user id.
+    assert lookup.await_args.args[1:] == ("browser-user-42", "my-server")
+
+
+def test_authorize_get_shows_form_without_stored_key(unauthenticated_client):
+    with (
+        patch("litellm.proxy.proxy_server.master_key", "test-master-key"),
+        patch("litellm.proxy.proxy_server.prisma_client", MagicMock()),
+        patch(
+            "litellm.proxy.mcp_server.byok_oauth_endpoints.get_user_credential",
+            AsyncMock(return_value=None),
+        ),
+        _no_catalog_db(),
+    ):
+        resp = unauthenticated_client.get(
+            "/v1/mcp/oauth/authorize",
+            params=_REUSE_PARAMS,
+            cookies={"token": _session_cookie()},
+            follow_redirects=False,
+        )
+    assert resp.status_code == 200
+    assert 'name="api_key"' in resp.text
+
+
+def test_authorize_get_without_session_never_looks_up_stored_key(unauthenticated_client):
+    """No UI session: behave exactly as before and render the form."""
+    lookup = AsyncMock(return_value="sk-stored-key")
+    with patch("litellm.proxy.mcp_server.byok_oauth_endpoints.get_user_credential", lookup):
+        resp = unauthenticated_client.get("/v1/mcp/oauth/authorize", params=_REUSE_PARAMS, follow_redirects=False)
+    assert resp.status_code == 200
+    assert 'name="api_key"' in resp.text
+    lookup.assert_not_awaited()
+
+
+def test_authorize_get_reuse_still_validates_redirect_uri(unauthenticated_client):
+    lookup = AsyncMock(return_value="sk-stored-key")
+    with (
+        patch("litellm.proxy.proxy_server.master_key", "test-master-key"),
+        patch("litellm.proxy.proxy_server.prisma_client", MagicMock()),
+        _no_catalog_db(),
+        patch("litellm.proxy.mcp_server.byok_oauth_endpoints.get_user_credential", lookup),
+    ):
+        resp = unauthenticated_client.get(
+            "/v1/mcp/oauth/authorize",
+            params={**_REUSE_PARAMS, "redirect_uri": "https://attacker.example.com/cb"},
+            cookies={"token": _session_cookie()},
+            follow_redirects=False,
+        )
+    assert resp.status_code == 400
+    lookup.assert_not_awaited()
+
+
+def test_authorize_get_reuse_rejects_non_s256(unauthenticated_client):
+    with (
+        patch("litellm.proxy.proxy_server.master_key", "test-master-key"),
+        patch("litellm.proxy.proxy_server.prisma_client", MagicMock()),
+        _no_catalog_db(),
+        patch(
+            "litellm.proxy.mcp_server.byok_oauth_endpoints.get_user_credential",
+            AsyncMock(return_value="sk-stored-key"),
+        ),
+    ):
+        resp = unauthenticated_client.get(
+            "/v1/mcp/oauth/authorize",
+            params={**_REUSE_PARAMS, "code_challenge_method": "plain"},
+            cookies={"token": _session_cookie()},
+            follow_redirects=False,
+        )
+    assert resp.status_code == 400
+
+
+def test_authorize_post_without_api_key_uses_stored_key(client):
+    lookup = AsyncMock(return_value="sk-stored-key")
+    form = {k: v for k, v in _REUSE_PARAMS.items() if k != "response_type"}
+    with (
+        patch("litellm.proxy.proxy_server.prisma_client", MagicMock()),
+        patch("litellm.proxy.mcp_server.byok_oauth_endpoints.get_user_credential", lookup),
+    ):
+        resp = client.post("/v1/mcp/oauth/authorize", data=form, follow_redirects=False)
+    assert resp.status_code == 302
+    entry = _byok_auth_codes[_code_from_location(resp.headers["location"])]
+    assert (entry["api_key"], entry["user_id"]) == ("sk-stored-key", "user-123")
+    assert lookup.await_args.args[1:] == ("user-123", "my-server")
+
+
+def test_authorize_post_without_api_key_and_no_stored_key_is_rejected(client):
+    form = {k: v for k, v in _REUSE_PARAMS.items() if k != "response_type"}
+    with (
+        patch("litellm.proxy.proxy_server.prisma_client", MagicMock()),
+        patch(
+            "litellm.proxy.mcp_server.byok_oauth_endpoints.get_user_credential",
+            AsyncMock(return_value=None),
+        ),
+    ):
+        resp = client.post("/v1/mcp/oauth/authorize", data=form, follow_redirects=False)
+    assert resp.status_code == 400
+
+
+def test_authorize_post_submitted_key_wins_over_stored_key(client):
+    lookup = AsyncMock(return_value="sk-stored-key")
+    form = {k: v for k, v in _REUSE_PARAMS.items() if k != "response_type"} | {"api_key": "sk-new-key"}
+    with (
+        patch("litellm.proxy.proxy_server.prisma_client", MagicMock()),
+        patch("litellm.proxy.mcp_server.byok_oauth_endpoints.get_user_credential", lookup),
+    ):
+        resp = client.post("/v1/mcp/oauth/authorize", data=form, follow_redirects=False)
+    assert resp.status_code == 302
+    assert _byok_auth_codes[_code_from_location(resp.headers["location"])]["api_key"] == "sk-new-key"
+    lookup.assert_not_awaited()
+
+
 # ---------------------------------------------------------------------------
 # Authorization POST endpoint
 # ---------------------------------------------------------------------------
