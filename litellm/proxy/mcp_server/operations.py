@@ -170,7 +170,12 @@ from litellm.types.mcp import (
     MCPTransport,
     without_header,
 )
-from litellm.types.mcp_server.mcp_server_manager import MCPInfo, MCPServer
+from litellm.types.mcp_server.mcp_server_manager import (
+    BYOK_CREDENTIAL_TEMPLATE_KEY,
+    MCPInfo,
+    MCPServer,
+    render_byok_credential_template,
+)
 from litellm.types.utils import CallTypes, StandardLoggingMCPToolCall
 from litellm.utils import Rules, client, function_setup
 
@@ -1907,7 +1912,7 @@ async def _get_byok_credential(
 
     cached: Final = get_cached_byok_credential(user_id, mcp_server.server_id)
     if cached is not None:
-        return cached.credential
+        return _apply_byok_credential_template(mcp_server, user_api_key_auth, cached.credential)
 
     from litellm.proxy.mcp_server.db import get_user_credential
     from litellm.proxy.proxy_server import prisma_client
@@ -1920,7 +1925,27 @@ async def _get_byok_credential(
         server_id=mcp_server.server_id,
     )
     cache_byok_credential(user_id, mcp_server.server_id, credential)
-    return credential
+    return _apply_byok_credential_template(mcp_server, user_api_key_auth, credential)
+
+
+def _apply_byok_credential_template(
+    mcp_server: MCPServer,
+    user_api_key_auth: UserAPIKeyAuth | None,
+    credential: str | None,
+) -> str | None:
+    """Compose the outbound value from ``mcp_info.byok_credential_template`` (e.g. ``{user_email}:{credential}``).
+
+    Placeholders are limited to the stored credential and the authenticated user's own id and email.
+    """
+    template: Final = (mcp_server.mcp_info or {}).get(BYOK_CREDENTIAL_TEMPLATE_KEY)
+    if not credential or not template:
+        return credential
+    return render_byok_credential_template(
+        str(template),
+        credential=credential,
+        user_email=(user_api_key_auth.user_email if user_api_key_auth else None) or "",
+        user_id=(user_api_key_auth.user_id if user_api_key_auth else None) or "",
+    )
 
 
 async def _check_byok_credential(

@@ -1,4 +1,5 @@
 import json
+import re
 from collections.abc import Mapping
 from datetime import datetime
 from typing import Annotated, Any, Final, Literal
@@ -18,6 +19,32 @@ from litellm.types.mcp import (
     validate_mcp_protocol_transport,
 )
 
+BYOK_CREDENTIAL_TEMPLATE_KEY: Final = "byok_credential_template"
+BYOK_CREDENTIAL_TEMPLATE_PLACEHOLDERS: Final = frozenset({"credential", "user_email", "user_id"})
+_BYOK_TEMPLATE_PLACEHOLDER_RE: Final = re.compile(r"\{([^{}]*)\}")
+
+
+def validate_byok_credential_template(template: object) -> str:
+    """A BYOK credential template must be a string that uses ``{credential}`` and only the known placeholders."""
+    if not isinstance(template, str):
+        raise ValueError(f"{BYOK_CREDENTIAL_TEMPLATE_KEY} must be a string")
+    placeholders: Final = set(_BYOK_TEMPLATE_PLACEHOLDER_RE.findall(template))
+    unknown: Final = placeholders - BYOK_CREDENTIAL_TEMPLATE_PLACEHOLDERS
+    if unknown:
+        raise ValueError(
+            f"{BYOK_CREDENTIAL_TEMPLATE_KEY} has unknown placeholders {sorted(unknown)}; "
+            f"allowed: {sorted(BYOK_CREDENTIAL_TEMPLATE_PLACEHOLDERS)}"
+        )
+    if "credential" not in placeholders:
+        raise ValueError(f"{BYOK_CREDENTIAL_TEMPLATE_KEY} must contain {{credential}}")
+    return template
+
+
+def render_byok_credential_template(template: str, credential: str, user_email: str, user_id: str) -> str:
+    """Substitute the placeholders in one pass, so a value that itself contains ``{...}`` is never re-expanded."""
+    values: Final = {"credential": credential, "user_email": user_email, "user_id": user_id}
+    return _BYOK_TEMPLATE_PLACEHOLDER_RE.sub(lambda m: values.get(m.group(1), m.group(0)), template)
+
 
 # MCPInfo now allows arbitrary additional fields for custom metadata
 def _validate_mcp_protocol_metadata(value: dict[str, object]) -> dict[str, object]:
@@ -27,6 +54,16 @@ def _validate_mcp_protocol_metadata(value: dict[str, object]) -> dict[str, objec
 
 
 MCPInfo = Annotated[dict[str, Any], AfterValidator(_validate_mcp_protocol_metadata)]
+
+
+def _validate_mcp_info_byok_template(value: dict[str, Any]) -> dict[str, Any]:
+    if value.get(BYOK_CREDENTIAL_TEMPLATE_KEY) is not None:
+        validate_byok_credential_template(value[BYOK_CREDENTIAL_TEMPLATE_KEY])
+    return value
+
+
+MCPInfoInput = Annotated[MCPInfo, AfterValidator(_validate_mcp_info_byok_template)]
+"""``MCPInfo`` as accepted on create/update; stored rows are loaded with plain ``MCPInfo`` so they never fail to load."""
 
 
 class MCPOAuthMetadata(LiteLLMBaseModel):

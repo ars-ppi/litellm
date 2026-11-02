@@ -70,7 +70,7 @@ from litellm.types.mcp import (
     MCPUpstreamProtocol,
     validate_mcp_protocol_transport,
 )
-from litellm.types.mcp_server.mcp_server_manager import MCPInfo
+from litellm.types.mcp_server.mcp_server_manager import MCPInfoInput
 from litellm.types.proxy.agent_identity import ManagedAgentContext
 from litellm.types.proxy.auth.special_headers import (
     SpecialHeaders as SpecialHeaders,  # noqa: PLC0414  # public re-export
@@ -1388,7 +1388,7 @@ class NewMCPServerRequest(LiteLLMPydanticObjectBase):
     credentials: MCPCredentials | None = None
     url: str | None = None
     spec_path: str | None = None
-    mcp_info: MCPInfo | None = None
+    mcp_info: MCPInfoInput | None = None
     mcp_access_groups: list[str] = Field(default_factory=list)
     allowed_tools: list[str] | None = None
     tool_name_to_display_name: dict[str, str] | None = None
@@ -1496,7 +1496,7 @@ class UpdateMCPServerRequest(LiteLLMPydanticObjectBase):
     credentials: MCPCredentials | None = None
     url: str | None = None
     spec_path: str | None = None
-    mcp_info: MCPInfo | None = None
+    mcp_info: MCPInfoInput | None = None
     mcp_access_groups: list[str] = Field(default_factory=list)
     allowed_tools: list[str] | None = None
     tool_name_to_display_name: dict[str, str] | None = None
